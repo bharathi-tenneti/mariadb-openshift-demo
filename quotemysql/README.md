@@ -47,3 +47,7 @@ Bash:
 `kubectl cp ./query_table_quotes.sql $PODNAME:/tmp/query_table_quotes.sql`  
 `kubectl cp ./query_table_quotes.sh $PODNAME:/tmp/query_table_quotes.sh`  
 `kubectl exec deploy/mysql -- /bin/bash ./tmp/query_table_quotes.sh`  
+
+
+Bash with Openshift commands:
+`$ ./dbscript.sh`
