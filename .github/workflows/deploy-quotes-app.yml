@@ -1,0 +1,260 @@
+name: Deploy Quotes Application to OpenShift
+
+on:
+  push:
+    branches:
+      - main
+      - update-quotesweb-deployment
+
+env:
+  REGISTRY_URL: quay.io
+  REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+  REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+  OPENSHIFT_SERVER: ${{ secrets.OPENSHIFT_SERVER }}
+  OPENSHIFT_TOKEN: ${{ secrets.OPENSHIFT_TOKEN }}
+  NAMESPACE: quotes-app
+  FRONTEND_IMAGE: quotesweb
+  BACKEND_IMAGE: qotd-python
+  DATABASE_NAME: quotesdb
+  DATABASE_USER: quotesuser
+  DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Log in to Container Registry
+        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${{ env.REGISTRY_URL }} -u ${{ secrets.REGISTRY_USERNAME }} --password-stdin
+
+      - name: Build Frontend Image
+        run: |
+          docker build -t ${{ env.REGISTRY_URL }}/${{ secrets.REGISTRY_USERNAME }}/${{ env.FRONTEND_IMAGE }}:latest ./quotesweb
+          docker push ${{ env.REGISTRY_URL }}/${{ secrets.REGISTRY_USERNAME }}/${{ env.FRONTEND_IMAGE }}:latest
+
+      - name: Build Backend Image
+        run: |
+          docker build -t ${{ env.REGISTRY_URL }}/${{ secrets.REGISTRY_USERNAME }}/${{ env.BACKEND_IMAGE }}:latest ./qotd-python
+          docker push ${{ env.REGISTRY_URL }}/${{ secrets.REGISTRY_USERNAME }}/${{ env.BACKEND_IMAGE }}:latest
+
+  deploy:
+    name: Deploy to OpenShift
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz
+          tar -xvf oc.tar.gz
+          sudo mv oc /usr/local/bin
+
+      - name: Log in to OpenShift
+        run: oc login ${{ env.OPENSHIFT_SERVER }} --token=${{ env.OPENSHIFT_TOKEN }} --insecure-skip-tls-verify=true
+
+      - name: Create Namespace
+        run: |
+          oc new-project ${{ env.NAMESPACE }} || echo "Namespace already exists"
+
+      - name: Deploy MariaDB
+        run: |
+          oc apply -f - <<EOF
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mariadb-secret
+            namespace: ${{ env.NAMESPACE }}
+          type: Opaque
+          data:
+            database-name: $(echo -n ${{ env.DATABASE_NAME }} | base64)
+            database-user: $(echo -n ${{ env.DATABASE_USER }} | base64)
+            database-password: $(echo -n ${{ env.DATABASE_PASSWORD }} | base64)
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: mariadb
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: mariadb
+            template:
+              metadata:
+                labels:
+                  app: mariadb
+              spec:
+                containers:
+                - name: mariadb
+                  image: mariadb:10.6
+                  env:
+                  - name: MYSQL_DATABASE
+                    valueFrom:
+                      secretKeyRef:
+                        name: mariadb-secret
+                        key: database-name
+                  - name: MYSQL_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: mariadb-secret
+                        key: database-user
+                  - name: MYSQL_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: mariadb-secret
+                        key: database-password
+                  - name: MYSQL_ROOT_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: mariadb-secret
+                        key: database-password
+                  ports:
+                  - containerPort: 3306
+                  resources:
+                    requests:
+                      memory: "256Mi"
+                      cpu: "250m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "500m"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: mariadb
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: mariadb
+            ports:
+            - port: 3306
+              targetPort: 3306
+          EOF
+
+      - name: Deploy Backend
+        run: |
+          oc apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: qotd-python
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: qotd-python
+            template:
+              metadata:
+                labels:
+                  app: qotd-python
+              spec:
+                containers:
+                - name: qotd-python
+                  image: ${{ env.REGISTRY_URL }}/${{ secrets.REGISTRY_USERNAME }}/${{ env.BACKEND_IMAGE }}:latest
+                  env:
+                  - name: DATABASE_HOST
+                    value: mariadb.${{ env.NAMESPACE }}.svc.cluster.local
+                  - name: DATABASE_NAME
+                    valueFrom:
+                      secretKeyRef:
+                        name: mariadb-secret
+                        key: database-name
+                  - name: DATABASE_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: mariadb-secret
+                        key: database-user
+                  - name: DATABASE_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: mariadb-secret
+                        key: database-password
+                  ports:
+                  - containerPort: 8080
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                    limits:
+                      memory: "256Mi"
+                      cpu: "500m"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: qotd-python
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: qotd-python
+            ports:
+            - port: 8080
+              targetPort: 8080
+          EOF
+
+      - name: Deploy Frontend
+        run: |
+          oc apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: quotesweb
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: quotesweb
+            template:
+              metadata:
+                labels:
+                  app: quotesweb
+              spec:
+                containers:
+                - name: quotesweb
+                  image: ${{ env.REGISTRY_URL }}/${{ secrets.REGISTRY_USERNAME }}/${{ env.FRONTEND_IMAGE }}:latest
+                  ports:
+                  - containerPort: 3000
+                  env:
+                  - name: QOTD_URL
+                    value: "http://qotd-python.${{ env.NAMESPACE }}.svc.cluster.local:8080"
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "250m"
+                    limits:
+                      memory: "256Mi"
+                      cpu: "500m"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: quotesweb
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: quotesweb
+            ports:
+            - port: 80
+              targetPort: 3000
+          EOF
+
+      - name: Expose Frontend Service
+        run: |
+          oc create route edge --service=quotesweb --insecure-policy=Redirect -n ${{ env.NAMESPACE }} || echo "Route already exists"
+
+      - name: Verify Deployment
+        run: |
+          echo "Waiting for deployments to be ready..."
+          oc rollout status deployment/mariadb -n ${{ env.NAMESPACE }} --timeout=300s
+          oc rollout status deployment/qotd-python -n ${{ env.NAMESPACE }} --timeout=300s
+          oc rollout status deployment/quotesweb -n ${{ env.NAMESPACE }} --timeout=300s
+          echo "All deployments are ready!"
+          echo "Frontend URL:"
+          oc get route quotesweb -n ${{ env.NAMESPACE }} -o jsonpath='{.spec.host}'
